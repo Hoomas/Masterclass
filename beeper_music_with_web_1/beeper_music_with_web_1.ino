@@ -43,12 +43,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 Piano Roll</title>
 <style>
-body{margin:0;background:#0d0f12;color:#e5e7eb;font-family:system-ui,Arial}
-.bar{display:flex;gap:10px;align-items:center;background:#111827;padding:8px 10px;position:sticky;top:0;z-index:10}
+body{margin:0;background:#0d0f12;color:#e5e7eb;font-family:system-ui,Arial;overflow:hidden}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#111827;padding:8px 10px;position:sticky;top:0;z-index:10}
 input,button{background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:5px;padding:4px 8px}
 button{cursor:pointer}
-#wrap{padding:8px}
-#roll{background:#111317;border:1px solid #374151;display:block;touch-action:none}
+#wrap{padding:8px;height:calc(100vh - 60px)}
+#roll{background:#111317;border:1px solid #374151;display:block;touch-action:none;width:100%;height:100%}
 #prog{width:240px}
 .on{background:#22c55e !important}
 </style>
@@ -58,18 +58,19 @@ button{cursor:pointer}
 <label>BPM <input id="bpm" type="number" min="30" max="240" value="120"></label>
 <button onclick="play()">Play</button>
 <button onclick="stopPlay()">Stop</button>
+<button id="loopBtn" onclick="toggleLoop()">Loop: OFF</button>
 <button id="eraseBtn" onclick="toggleErase()">Eraser: OFF</button>
 <label style="font-size:12px">MIDI <input id="midiFile" type="file" accept=".mid,.midi" onchange="loadMidi(event)" style="font-size:12px"></label>
 <input id="prog" type="range" min="0" max="1" value="0" step="1" disabled>
 <span style="font-size:12px;opacity:.8">Ноты слева, поле справа. Клик=нота. Eraser=стереть. MIDI: загрузить файл.</span>
 </div>
 <div id="wrap">
-<canvas id="roll" width="1500" height="528"></canvas>
+<canvas id="roll"></canvas>
 </div>
 <script>
 "use strict";
 let canvas,ctx,W,H;
-const rows=24,cols=64;
+const rows=24,cols=128;
 let cellW=22,cellH=22;
 const labelW=70;
 let areaW=cols*cellW;
@@ -77,7 +78,7 @@ let bpm=120;
 const notes=[];
 const baseMidi=48;
 let drag=null;
-let isPlaying=false,playStartT=0,totalMs=0,rafId=0,statusTimer=null;
+let isPlaying=false,playStartT=0,totalMs=0,rafId=0,statusTimer=null,loopEnabled=false;
 let eraseMode=false;
 const defaultTempoUs=500000;
 
@@ -91,6 +92,11 @@ function calcTotalMs(){
 }
 
 function resize(){
+  const avail=Math.max(window.innerWidth-16, labelW+200);
+  const desired=avail-labelW;
+  const minCell=12, maxCell=26;
+  cellW=Math.max(minCell, Math.min(maxCell, Math.floor(desired/cols)));
+  areaW=cellW*cols;
   canvas.width=labelW+areaW;
   canvas.height=rows*cellH;
   W=canvas.width; H=canvas.height;
@@ -171,6 +177,13 @@ function toggleErase(){
   else{ b.classList.remove("on"); b.textContent="Eraser: OFF"; }
 }
 
+function toggleLoop(){
+  loopEnabled=!loopEnabled;
+  const b=document.getElementById("loopBtn");
+  if(loopEnabled){ b.classList.add("on"); b.textContent="Loop: ON"; }
+  else{ b.classList.remove("on"); b.textContent="Loop: OFF"; }
+}
+
 function onDown(e){
   const r=canvas.getBoundingClientRect();
   const x=e.clientX-r.left, y=e.clientY-r.top;
@@ -236,7 +249,11 @@ function startStatusPoll(){
         document.getElementById("prog").max=gridTotal;
         isPlaying=true;
       }else{
-        isPlaying=false;
+        if(isPlaying && loopEnabled && notes.length>0){
+          await play(true);
+        }else{
+          isPlaying=false;
+        }
       }
     }catch(e){}
   },200);
@@ -246,7 +263,7 @@ function stopStatusPoll(){
   if(statusTimer){ clearInterval(statusTimer); statusTimer=null; }
 }
 
-async function play(){
+async function play(skipScroll=false){
   setBPM();
   const qMs=Math.floor(60000/bpm);
   const cellMs=Math.floor(qMs/4);
@@ -262,6 +279,11 @@ async function play(){
     isPlaying=true;
     playStartT=performance.now();
     startStatusPoll();
+    if(!skipScroll){
+      const prog=document.getElementById("prog");
+      prog.max=totalMs;
+      prog.value=0;
+    }
     if(rafId) cancelAnimationFrame(rafId);
     (function loop(){ draw(); if(isPlaying) rafId=requestAnimationFrame(loop); })();
   }catch(e){}
