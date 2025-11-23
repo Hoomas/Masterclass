@@ -59,8 +59,9 @@ button{cursor:pointer}
 <button onclick="play()">Play</button>
 <button onclick="stopPlay()">Stop</button>
 <button id="eraseBtn" onclick="toggleErase()">Eraser: OFF</button>
+<label style="font-size:12px">MIDI <input id="midiFile" type="file" accept=".mid,.midi" onchange="loadMidi(event)" style="font-size:12px"></label>
 <input id="prog" type="range" min="0" max="1" value="0" step="1" disabled>
-<span style="font-size:12px;opacity:.8">Ноты слева, поле справа. Клик=нота. Eraser=стереть.</span>
+<span style="font-size:12px;opacity:.8">Ноты слева, поле справа. Клик=нота. Eraser=стереть. MIDI: загрузить файл.</span>
 </div>
 <div id="wrap">
 <canvas id="roll" width="1500" height="528"></canvas>
@@ -78,6 +79,7 @@ const baseMidi=48;
 let drag=null;
 let isPlaying=false,playStartT=0,totalMs=0,rafId=0,statusTimer=null;
 let eraseMode=false;
+const defaultTempoUs=500000;
 
 function calcTotalMs(){
   const qMs=Math.floor(60000/Math.max(30,Math.min(240,bpm)));
@@ -272,6 +274,107 @@ async function stopPlay(){
   document.getElementById("prog").value=0;
   try{ await fetch("/stop"); }catch(e){}
   draw();
+}
+
+function readVarLen(data,idx){
+  let val=0,b;
+  do{ b=data[idx++]; val=(val<<7)|(b&0x7f); }while(b&0x80 && idx<data.length);
+  return {val,next:idx};
+}
+
+function parseMidiFile(buf){
+  const data=new Uint8Array(buf);
+  let i=0;
+  if(String.fromCharCode(...data.slice(0,4))!="MThd") throw new Error("No header");
+  i=8; // skip chunk len
+  const division=(data[12]<<8)|data[13];
+  const ticksPerQ=division&0x7fff;
+  i=14;
+  if(ticksPerQ<=0) throw new Error("Bad division");
+
+  if(String.fromCharCode(...data.slice(i,i+4))!="MTrk") throw new Error("No track");
+  const trackLen=(data[i+4]<<24)|(data[i+5]<<16)|(data[i+6]<<8)|data[i+7];
+  i+=8;
+  const end=i+trackLen;
+
+  let tempoUs=defaultTempoUs;
+  const openNotes={};
+  const parsed=[];
+  let running=0;
+  let tTicks=0;
+
+  while(i<end){
+    const d=readVarLen(data,i); i=d.next; tTicks+=d.val;
+    let status=data[i];
+    if(status<0x80){
+      if(!running) throw new Error("Missing status");
+      status=running;
+    }else{ i++; running=status; }
+
+    if(status===0xff){
+      const type=data[i++];
+      const len=readVarLen(data,i); i=len.next; const metaLen=len.val;
+      if(type===0x51 && metaLen===3){
+        tempoUs=(data[i]<<16)|(data[i+1]<<8)|data[i+2];
+      }
+      i+=metaLen;
+      continue;
+    }
+
+    const evt=status>>4; const ch=status&0x0f;
+    if(evt===0x9 || evt===0x8){
+      const note=data[i++]; const vel=data[i++];
+      const key=`${ch}:${note}`;
+      if(evt===0x9 && vel>0){
+        const ms=Math.floor((tTicks*tempoUs)/(ticksPerQ*1000));
+        openNotes[key]=ms;
+      }else{
+        if(openNotes[key]!==undefined){
+          const startMs=openNotes[key];
+          const ms=Math.floor((tTicks*tempoUs)/(ticksPerQ*1000));
+          const dur=ms-startMs; if(dur>0) parsed.push({note,startMs,dur});
+          delete openNotes[key];
+        }
+      }
+    }else{
+      // skip other channel event data lengths
+      const skip=[2,2,2,2,1,1,2][evt-0x8]||0;
+      i+=skip;
+    }
+  }
+
+  return {notes:parsed,tempoUs};
+}
+
+function mapMidiToGrid(parsed){
+  const {notes:parsedNotes,tempoUs}=parsed;
+  if(!parsedNotes.length) throw new Error("Нет нот в файле");
+  const midiBpm=Math.round(60000000/tempoUs);
+  bpm=Math.max(30,Math.min(240,midiBpm));
+  document.getElementById("bpm").value=bpm;
+  calcTotalMs();
+  const qMs=Math.floor(60000/bpm);
+  const cellMs=Math.floor(qMs/4);
+  notes.length=0;
+  for(const n of parsedNotes){
+    const row=n.note-baseMidi; if(row<0||row>=rows) continue;
+    let col=Math.round(n.startMs/cellMs); if(col>=cols) continue;
+    let len=Math.max(1,Math.round(n.dur/cellMs));
+    if(col+len>cols) len=cols-col;
+    notes.push({row,col,len});
+  }
+  draw();
+}
+
+async function loadMidi(ev){
+  const f=ev.target.files[0]; if(!f) return;
+  try{
+    const buf=await f.arrayBuffer();
+    const parsed=parseMidiFile(buf);
+    mapMidiToGrid(parsed);
+  }catch(e){
+    alert("Ошибка MIDI: "+e.message);
+  }
 }
 
 window.addEventListener("load",()=>{
