@@ -350,6 +350,79 @@ void sendHTML(WiFiClient& client) {
 
   client.println(F("function onUp(){ drag=null; }"));
 
+  // MIDI
+  client.println(F("function readVarLen(view,offset){"));
+    "let result=0, i=offset;"
+    "while(i<view.byteLength){ const b=view.getUint8(i++); result=(result<<7)|(b&0x7F); if(!(b&0x80)) break; }"
+    "return {value:result, next:i};"
+  "}"));
+
+  client.println(F("function parseMidi(buf){"));
+    "const view=new DataView(buf);"
+    "function readStr(o,l){ let s=''; for(let i=0;i<l;i++) s+=String.fromCharCode(view.getUint8(o+i)); return s; }"
+    "if(readStr(0,4)!=='MThd') return null;"
+    "const headerLen=view.getUint32(4,false); if(headerLen<6) return null;"
+    "const format=view.getUint16(8,false); const ntrks=view.getUint16(10,false); const division=view.getUint16(12,false);"
+    "if(division & 0x8000) return null;"
+    "let offset=8+headerLen;"
+    "let tempoUs=500000; // default 120 bpm"
+    "const notes=[];"
+    "function parseTrack(){"
+      "if(readStr(offset,4)!=='MTrk') return false;"
+      "const len=view.getUint32(offset+4,false);"
+      "let i=offset+8, end=i+len, time=0, running=0;"
+      "const active={};"
+      "while(i<end){"
+        "const d=readVarLen(view,i); time+=d.value; i=d.next;"
+        "if(i>=end) break;"
+        "let status=view.getUint8(i++);"
+        "if(status<0x80){ i--; status=running; } else { running=status; }"
+        "const type=status & 0xF0;"
+        "if(type===0x90 || type===0x80){"
+          "const note=view.getUint8(i++); const vel=view.getUint8(i++);"
+          "if(type===0x90 && vel>0){ active[note]=time; } else {"
+            "if(active[note]!==undefined){ const st=active[note]; const dur=time-st; if(dur>0) notes.push({midi:note,start:st,dur}); delete active[note]; }"
+          "}"
+        "} else if(status===0xFF){"
+          "const meta=view.getUint8(i++); const lenInfo=readVarLen(view,i); const l=lenInfo.value; i=lenInfo.next;"
+          "if(meta===0x51 && l===3){ tempoUs=(view.getUint8(i)<<16)|(view.getUint8(i+1)<<8)|view.getUint8(i+2); }"
+          "i+=l;"
+        "} else {"
+          "const dataLen=(type===0xC0||type===0xD0)?1:2; i+=dataLen;"
+        "}"
+      "}"
+      "offset=end; return true;"
+    "}"
+    "for(let t=0;t<ntrks;t++){ if(!parseTrack()) break; }"
+    "const bpmVal=60000000/tempoUs;"
+    "const tickMs=tempoUs/1000/division;"
+    "return {bpm:bpmVal, notes:notes.map(n=>({midi:n.midi,startMs:n.start*tickMs,durMs:n.dur*tickMs}))};"
+  "}"));
+
+  client.println(F("function setNotesFromMidi(m){"));
+    "const qMs=Math.floor(60000/Math.max(30,Math.min(240,bpm)));"
+    "const cellMs=Math.floor(qMs/4);"
+    "notes.length=0;"
+    "let maxEnd=0;"
+    "for(const n of m.notes){"
+      "const row=n.midi-baseMidi; if(row<0||row>=rows) continue;"
+      "let col=Math.round(n.startMs/cellMs); let len=Math.max(1,Math.round(n.durMs/cellMs));"
+      "if(col>=cols) continue;"
+      "if(col+len>cols) len=cols-col;"
+      "notes.push({row,col,len});"
+      "const end=(col+len)*cellMs; if(end>maxEnd) maxEnd=end;"
+    "}"
+    "if(maxEnd>0){ const p=document.getElementById('prog'); p.max=maxEnd; totalMs=maxEnd; }"
+  "}"));
+
+  client.println(F("async function loadMidiFile(input){"));
+    "const f=input.files?.[0]; if(!f) return;"
+    "try{ const buf=await f.arrayBuffer(); const midi=parseMidi(buf); if(!midi){ alert('Не удалось прочитать MIDI'); return; }"
+      "if(midi.bpm){ bpm=Math.round(midi.bpm); document.getElementById('bpm').value=bpm; }"
+      "setNotesFromMidi(midi); calcTotalMs(); draw();"
+    "}catch(e){ console.error(e); alert('Ошибка загрузки MIDI'); }"
+  "}"));
+
   // BPM
   client.println(F("function setBPM(){"
     "let v=parseInt(document.getElementById('bpm').value||'120');"
@@ -431,6 +504,7 @@ void sendHTML(WiFiClient& client) {
   client.println(F("</script></head><body>"));
   client.println(F("<div class='bar'>"
     "<label>BPM <input id='bpm' type='number' min='30' max='240' value='120' oninput='setBPM()'></label>"
+    "<label style='display:flex;align-items:center;gap:6px;'>MIDI <input id='midiFile' type='file' accept='.mid,.midi' onchange='loadMidiFile(this)'></label>"
     "<button onclick='play()'>Play</button>"
     "<button onclick='stopPlay()'>Stop</button>"
     "<input id='prog' type='range' min='0' max='1' value='0' step='1' disabled>"
